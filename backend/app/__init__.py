@@ -1,0 +1,1 @@
+"""Kids Pixel Pals Backend Application"""
