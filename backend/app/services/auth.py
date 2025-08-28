@@ -1,12 +1,15 @@
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from fastapi import HTTPException, status
-from datetime import timedelta
+from datetime import datetime, timedelta
+import secrets
+import string
 
 from app.core.security import get_password_hash, verify_password, create_access_token, create_refresh_token
 from app.models.user import User, UserRole, Profile
 from app.schemas.auth import UserCreate, ParentRegisterRequest, ChildCreateRequest
 from app.schemas.profile import ProfileCreate
+from app.core.config import settings
 
 
 class AuthService:
@@ -151,3 +154,69 @@ class AuthService:
         db.commit()
         db.refresh(user)
         return user
+
+    @staticmethod
+    def request_password_reset(db: Session, email: str):
+        """Request password reset (generates and stores reset token)"""
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            # Don't reveal if email exists for security
+            return
+        
+        # Generate secure reset token
+        reset_token = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(32))
+        
+        # Store token in Redis with 1-hour expiration
+        redis_client = redis.from_url(str(settings.redis_url))
+        redis_client.setex(
+            f"password_reset:{reset_token}",
+            3600,  # 1 hour
+            str(user.id)
+        )
+        
+        # In production, you would send an email here with the reset token
+        # For development, we'll just log it
+        print(f"Password reset token for {email}: {reset_token}")
+
+    @staticmethod
+    def confirm_password_reset(db: Session, token: str, new_password: str):
+        """Confirm password reset with token"""
+        redis_client = redis.from_url(str(settings.redis_url))
+        user_id = redis_client.get(f"password_reset:{token}")
+        
+        if not user_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid or expired reset token"
+            )
+        
+        user = db.query(User).filter(User.id == int(user_id)).first()
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+        
+        # Update password
+        user.password_hash = get_password_hash(new_password)
+        db.commit()
+        
+        # Delete used token
+        redis_client.delete(f"password_reset:{token}")
+        
+        # Blacklist all existing tokens for this user
+        # This would require maintaining a token-user mapping in production
+
+    @staticmethod
+    def change_password(db: Session, user: User, current_password: str, new_password: str):
+        """Change password for authenticated user"""
+        if not verify_password(current_password, user.password_hash):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Current password is incorrect"
+            )
+        
+        user.password_hash = get_password_hash(new_password)
+        db.commit()
+        
+        # In production, you might want to blacklist existing tokens here
